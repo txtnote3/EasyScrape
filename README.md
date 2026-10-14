@@ -17,7 +17,7 @@ For local development, install the optional tools as well:
 python -m pip install -e ".[dev]"
 ```
 
-Runtime dependencies include yt-dlp, gallery-dl, Rich, HTTPX, Mutagen, and ytmusicapi. The development extra adds pytest, Ruff, mypy, and the Python build frontend.
+Runtime dependencies include yt-dlp, gallery-dl, Rich, HTTPX, Mutagen, and ytmusicapi. EasyScrape requests yt-dlp's `default` extra so pip installs the matching `yt-dlp-ejs` JavaScript challenge package along with yt-dlp. The development extra adds pytest, Ruff, mypy, and the Python build frontend.
 
 ## Use
 
@@ -50,6 +50,31 @@ Support depends on the matching adapter, upstream extractor, and specific URL.
 | Threads | No adapter currently supports Threads downloads. | Threads requires a signed-in session, but neither yt-dlp nor gallery-dl currently provides a matching extractor. |
 
 The `--audio-only` option asks applicable extractors for audio output. It does not improve the quality of the source. Use the service's official app and access methods when a site does not expose media to the supported extractors.
+
+### Windows media tools
+
+yt-dlp may need a JavaScript runtime for YouTube extraction. EasyScrape automatically detects Deno, Node.js, Bun, or QuickJS when the executable is on `PATH` and passes it to yt-dlp; it does not install runtimes for you. The `yt-dlp[default]` dependency installs the matching `yt-dlp-ejs` package through pip. After updating an existing EasyScrape checkout, refresh its dependencies with `python -m pip install --upgrade -e ".[dev]"` so the yt-dlp and EJS versions match. On Windows, Deno's [official installation guide](https://docs.deno.com/runtime/getting_started/installation/) documents this Winget command:
+
+```powershell
+winget install DenoLand.Deno
+```
+
+After installation, close and reopen PowerShell or Windows Terminal so the updated `PATH` is loaded, then check:
+
+```powershell
+deno --version
+```
+
+If yt-dlp reports a missing JavaScript runtime, EasyScrape keeps a runtime warning in the download report. Install Deno or another supported runtime, then use `--force` to retry an item that was already cached.
+
+For video downloads, install an FFmpeg build that provides both `ffmpeg` and `ffprobe` on `PATH`. Check that the commands are available with:
+
+```powershell
+ffmpeg -version
+ffprobe -version
+```
+
+When `ffprobe` is available, EasyScrape checks the finished file for a video stream. If it is missing, EasyScrape uses yt-dlp's selected-format metadata; it rejects a download if that metadata cannot establish that a video stream was selected. `ffmpeg` may also be needed when a site provides video and audio as separate streams.
 
 ## Extractor plugins
 

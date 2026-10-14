@@ -2,7 +2,7 @@ import base64
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 from gallery_dl import config, exception, extractor, job
@@ -10,6 +10,71 @@ from gallery_dl.extractor.common import Extractor, Message
 
 from easyscrape.extractors import gallery_dl_adapter as adapter
 from easyscrape.models import DownloadContext, DownloadError, RetryableError
+
+
+@pytest.mark.parametrize("root", [
+    PureWindowsPath(r"C:\Users\alice\output\.easyscrape-gallery-stage"),
+    PureWindowsPath(r"\\server\share\output\.easyscrape-gallery-stage"),
+])
+@pytest.mark.parametrize("extended_root", [False, True])
+@pytest.mark.parametrize("extended_child", [False, True])
+def test_windows_extended_paths_share_staging_anchor(root, extended_root, extended_child):
+    def extended(path):
+        text = str(path)
+        prefix = "\\\\?\\UNC\\" + text[2:] if text.startswith("\\\\") else "\\\\?\\" + text
+        return PureWindowsPath(prefix)
+
+    child = root / "alice" / "123" / "photo.jpg"
+    if extended_root:
+        root = extended(root)
+    if extended_child:
+        child = extended(child)
+    original = str(child)
+    if extended_root != extended_child:
+        with pytest.raises(ValueError):
+            child.relative_to(root)  # Reproduce gallery-dl's original anchor mismatch.
+    assert adapter._relative_path(child, root) == PureWindowsPath(r"alice\123\photo.jpg")
+    assert adapter._relative_path(child.parent, root) == PureWindowsPath(r"alice\123")
+    assert str(child) == original  # File-operation paths retain their original prefix.
+
+
+@pytest.mark.parametrize("child, root", [
+    (r"\\?\C:\output-other\file.jpg", r"C:\output"),
+    (r"\\?\D:\output\file.jpg", r"C:\output"),
+    (r"\\?\UNC\server\other-share\output\file.jpg", r"\\server\share\output"),
+    (r"\\?\UNC\other-server\share\output\file.jpg", r"\\server\share\output"),
+    (r"\\?\UNC\server\share\output-other\file.jpg", r"\\server\share\output"),
+    (r"\\.\C:\output\file.jpg", r"C:\output"),
+])
+def test_windows_extended_path_normalization_preserves_containment(child, root):
+    with pytest.raises(ValueError):
+        adapter._relative_path(PureWindowsPath(child), PureWindowsPath(root))
+
+
+@pytest.mark.parametrize("root", [
+    PureWindowsPath(r"C:\output"), PureWindowsPath(r"\\server\share\output"),
+])
+def test_windows_long_paths_keep_all_segments(root):
+    relative = PureWindowsPath(*(["a" * 80] * 4), "photo.jpg")
+    text = str(root / relative)
+    child = PureWindowsPath(
+        "\\\\?\\UNC\\" + text[2:] if text.startswith("\\\\") else "\\\\?\\" + text
+    )
+    assert len(str(child)) > 260
+    assert adapter._relative_path(child, root) == relative
+    assert str(child).startswith("\\\\?\\")
+
+
+def test_windows_comparisons_preserve_case_insensitive_paths():
+    assert adapter._relative_path(
+        PureWindowsPath(r"\\?\c:\OUTPUT\alice\photo.jpg"), PureWindowsPath(r"C:\output"),
+    ) == PureWindowsPath(r"alice\photo.jpg")
+
+
+def test_posix_paths_with_windows_prefix_text_are_not_normalized():
+    root = PurePosixPath("/output")
+    child = root / r"\\?\C:\photo.jpg"
+    assert adapter._relative_path(child, root) == PurePosixPath(r"\\?\C:\photo.jpg")
 
 
 class SampleExtractor(Extractor):

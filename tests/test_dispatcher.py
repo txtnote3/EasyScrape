@@ -58,6 +58,38 @@ def test_dispatcher_continues_after_one_url_fails_and_writes_report_files(
     assert failures[0]["url"] == "https://example.org/bad"
 
 
+@pytest.mark.parametrize("quiet", [False, True])
+def test_success_warning_is_persisted_without_failing_download(
+    tmp_path: Path,
+    quiet: bool,
+) -> None:
+    advice = "Install Deno."
+
+    def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
+        result = result_for(url, ctx.out_dir)
+        result.warnings = [advice]
+        return [result]
+
+    report = Dispatcher(
+        DownloadContext(out_dir=tmp_path, quiet=quiet),
+        registry=make_registry(handle),
+        delay=0,
+    ).run(_batch("https://example.org/video"))
+
+    assert len(report.successful) == 1
+    assert report.failed == []
+    assert report.exit_code == 0
+    assert "Warning: " + advice in report.successful[0]["message"]
+    persisted_report = (tmp_path / "report.txt").read_text(encoding="utf-8")
+    assert "Warning:" in persisted_report
+    assert advice in persisted_report
+    assert json.loads((tmp_path / "failed.json").read_text(encoding="utf-8")) == []
+    metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["title"] == "sample"
+    assert metadata["warnings"] == [advice]
+    assert (tmp_path / "media.bin").is_file()
+
+
 def test_retryable_error_retries_at_most_three_times_with_exponential_backoff(
     tmp_path: Path,
 ) -> None:
@@ -151,12 +183,8 @@ def test_idempotence_survives_dispatcher_instances_and_force_overrides_it(
 
     registry = make_registry(handle)
     batch = _batch("https://example.org/item")
-    first = Dispatcher(DownloadContext(out_dir=tmp_path), registry=registry, delay=0).run(
-        batch
-    )
-    second = Dispatcher(DownloadContext(out_dir=tmp_path), registry=registry, delay=0).run(
-        batch
-    )
+    first = Dispatcher(DownloadContext(out_dir=tmp_path), registry=registry, delay=0).run(batch)
+    second = Dispatcher(DownloadContext(out_dir=tmp_path), registry=registry, delay=0).run(batch)
     forced = Dispatcher(
         DownloadContext(out_dir=tmp_path, force=True), registry=registry, delay=0
     ).run(batch)
@@ -302,9 +330,9 @@ def test_forced_single_url_failure_invalidates_previous_success_cache(tmp_path: 
     forced = Dispatcher(
         DownloadContext(out_dir=tmp_path, force=True), registry=registry, delay=0
     ).run(batch)
-    after_failure = Dispatcher(
-        DownloadContext(out_dir=tmp_path), registry=registry, delay=0
-    ).run(batch)
+    after_failure = Dispatcher(DownloadContext(out_dir=tmp_path), registry=registry, delay=0).run(
+        batch
+    )
 
     assert len(first.successful) == 1
     assert len(forced.failed) == 1
@@ -339,9 +367,9 @@ def test_forced_child_failure_invalidates_parent_collection_cache(tmp_path: Path
         raise AssertionError(f"unexpected input URL: {url}")
 
     registry = make_registry(handle)
-    initial = Dispatcher(
-        DownloadContext(out_dir=tmp_path), registry=registry, delay=0
-    ).run(_batch(collection))
+    initial = Dispatcher(DownloadContext(out_dir=tmp_path), registry=registry, delay=0).run(
+        _batch(collection)
+    )
     forced_child = Dispatcher(
         DownloadContext(out_dir=tmp_path, force=True), registry=registry, delay=0
     ).run(_batch(child_two))
@@ -357,12 +385,12 @@ def test_forced_child_failure_invalidates_parent_collection_cache(tmp_path: Path
     assert cache.is_downloaded(child_one)
     assert not cache.is_downloaded(child_two)
 
-    resumed = Dispatcher(
-        DownloadContext(out_dir=tmp_path), registry=registry, delay=0
-    ).run(_batch(collection))
-    repeated = Dispatcher(
-        DownloadContext(out_dir=tmp_path), registry=registry, delay=0
-    ).run(_batch(collection))
+    resumed = Dispatcher(DownloadContext(out_dir=tmp_path), registry=registry, delay=0).run(
+        _batch(collection)
+    )
+    repeated = Dispatcher(DownloadContext(out_dir=tmp_path), registry=registry, delay=0).run(
+        _batch(collection)
+    )
 
     assert resumed.successful[0]["url"] == child_two
     assert any(row["url"] == child_one for row in resumed.skipped)

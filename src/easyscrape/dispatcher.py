@@ -113,11 +113,14 @@ class Dispatcher:
                                             "files": files,
                                             "platform": result.platform,
                                         }
+                                    details = result.title or f"{len(files)} file(s)"
+                                    if result.warnings:
+                                        details += "; Warning: " + "; ".join(result.warnings)
                                     report.successful.append(
                                         {
                                             "url": result.url,
                                             "platform": result.platform,
-                                            "message": result.title or f"{len(files)} file(s)",
+                                            "message": details,
                                         }
                                     )
                                 except Exception as exc:

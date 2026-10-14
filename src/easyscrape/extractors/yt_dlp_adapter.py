@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -18,6 +20,10 @@ from easyscrape.models import DownloadContext, DownloadError, MediaResult, Retry
 
 PLATFORM = "youtube"
 MATCHERS = [r"^https?://(?:[\w-]+\.)?(?:youtube\.com|youtu\.be)(?:[/:?#]|$)"]
+_RUNTIME_ADVICE = (
+    "YouTube video formats may be missing. Install Deno and put it on PATH, "
+    "or install a supported Node.js runtime; then retry with --force."
+)
 
 
 class NoMediaError(DownloadError):
@@ -28,15 +34,29 @@ class _Logger:
     def __init__(self, ctx: DownloadContext) -> None:
         self.ctx = ctx
         self.errors: list[str] = []
+        self.runtime_warnings: list[str] = []
 
     def debug(self, message: str) -> None:
         pass
 
     def warning(self, message: str) -> None:
+        if re.search(r"javascript runtime|js.runtime|js-runtimes", message, re.I):
+            self.runtime_warnings.append(message)
         self.ctx.log(f"yt-dlp: {message}")
 
     def error(self, message: str) -> None:
         self.errors.append(message)
+
+    def failure_message(self, message: str) -> str:
+        if self.runtime_warnings and "Install Deno" not in message:
+            return f"{message}. {self.media_warnings()[-1]}"
+        return message
+
+    def media_warnings(self) -> list[str]:
+        return [
+            f"yt-dlp JavaScript runtime warning: {warning} {_RUNTIME_ADVICE}"
+            for warning in dict.fromkeys(self.runtime_warnings)
+        ]
 
 
 def _browser_cookies(specification: str) -> tuple[str, str | None, str | None, str | None]:
@@ -147,6 +167,106 @@ def _download_media(
     raise DownloadError("Download attempts were exhausted")
 
 
+def _probe_stream_types(path: Path) -> set[str] | None:
+    """Inspect the finished file when ffprobe is installed; never infer from its suffix."""
+    executable = shutil.which("ffprobe")
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "-v", "error", "-show_streams", "-of", "json", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode:
+            raise DownloadError(
+                f"ffprobe could not inspect the finished media: {result.stderr.strip()}"
+            )
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict):
+            raise DownloadError(
+                "ffprobe returned invalid stream information for the finished media"
+            )
+        streams = payload.get("streams")
+        if not isinstance(streams, list):
+            raise DownloadError("ffprobe returned no stream information for the finished media")
+        return {
+            str(stream["codec_type"])
+            for stream in streams
+            if isinstance(stream, dict)
+            and stream.get("codec_type")
+            and not (stream.get("disposition") or {}).get("attached_pic")
+        }
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise DownloadError(f"Could not verify finished media streams with ffprobe: {exc}") from exc
+
+
+def _selected_video(info: dict[str, Any], path: Path) -> bool | None:
+    """Fallback evidence comes from selected streams, never other available formats."""
+    for download in info.get("requested_downloads") or []:
+        if not isinstance(download, dict):
+            continue
+        filename = download.get("filepath") or download.get("filename")
+        if filename and Path(filename).resolve() == path.resolve() and "vcodec" in download:
+            return _format_video(download)
+    selected = info.get("requested_formats")
+    if isinstance(selected, list) and selected:
+        states = [_format_video(item) for item in selected if isinstance(item, dict)]
+        if any(state is True for state in states):
+            return True
+        if states and all(state is False for state in states):
+            return False
+        return None
+    return _format_video(info)
+
+
+def _format_video(info: dict[str, Any]) -> bool | None:
+    codec = str(info.get("vcodec") or "").lower()
+    if codec == "none" or str(info.get("resolution") or "").lower() == "audio only":
+        return False
+    if codec not in {"", "unknown"}:
+        return True
+    if isinstance(info.get("height"), (int, float)) and info["height"] > 0:
+        return True
+    return None
+
+
+def _validate_finished_media(files: list[Path], info: dict[str, Any], audio_only: bool) -> None:
+    if audio_only:
+        return
+    for path in files:
+        streams = _probe_stream_types(path)
+        has_video = "video" in streams if streams is not None else _selected_video(info, path)
+        if has_video is None:
+            raise DownloadError(
+                "Cannot verify a video stream: ffprobe is unavailable and the selected format "
+                "does not identify a video codec. Install ffmpeg (including ffprobe) to verify it."
+            )
+        if not has_video:
+            raise DownloadError(
+                "The finished media has no video stream (audio-only output). "
+                "Use --audio-only for audio, or check yt-dlp's available video formats and retry."
+            )
+
+
+def _js_runtimes() -> dict[str, dict[str, str]]:
+    runtimes: dict[str, dict[str, str]] = {}
+    for name, binaries in (
+        ("deno", ("deno",)),
+        ("node", ("node",)),
+        ("bun", ("bun",)),
+        ("quickjs", ("qjs", "quickjs")),
+    ):
+        for binary in binaries:
+            executable = shutil.which(binary)
+            if executable:
+                runtimes[name] = {"path": executable}
+                break
+    return runtimes
+
+
 def _publish_media(files: list[Path], directory: Path, force: bool) -> list[Path]:
     """Publish finished files without opening existing targets or downloader sidecars."""
     destinations = [directory / path.name for path in files]
@@ -204,6 +324,8 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
         options["cookiefile"] = str(ctx.cookies)
     if ctx.cookies_from_browser:
         options["cookiesfrombrowser"] = _browser_cookies(ctx.cookies_from_browser)
+    if runtimes := _js_runtimes():
+        options["js_runtimes"] = runtimes
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
             extracted = downloader.extract_info(url, download=False)
@@ -246,7 +368,7 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
                         if initial_errors
                         else "A collection entry could not be extracted"
                     )
-                    ctx.record_failure(url, message, platform)
+                    ctx.record_failure(url, logger.failure_message(message), platform)
                     continue
                 media_url = str(entry.get("webpage_url") or entry.get("original_url") or url)
                 if ctx.is_downloaded(media_url):
@@ -284,7 +406,21 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
                         downloaded, staged_files = _download_media(
                             downloader, entry, events, staging, ctx, logger
                         )
+                        _validate_finished_media(staged_files, downloaded, ctx.audio_only)
+                        for staged_file in staged_files:
+                            existing = directory / staged_file.name
+                            if not ctx.force and existing.is_file() and not existing.is_symlink():
+                                # Fresh extractor metadata describes staged bytes, not an old file.
+                                # Existing media needs its own probe or an explicit forced retry.
+                                try:
+                                    _validate_finished_media([existing], {}, ctx.audio_only)
+                                except DownloadError as exc:
+                                    raise DownloadError(
+                                        f"Could not verify existing media: {exc} "
+                                        "Use --force to download and verify fresh media."
+                                    ) from exc
                         files = _publish_media(staged_files, directory, ctx.force)
+                        _validate_finished_media(files, downloaded, ctx.audio_only)
                     results.append(
                         MediaResult(
                             url=media_url,
@@ -299,19 +435,25 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
                                 or ""
                             ),
                             license_notes=str(downloaded.get("license") or ""),
+                            warnings=logger.media_warnings(),
                         )
                     )
                 except DownloadError as exc:
                     if isinstance(exc, NoMediaError) and len(entries) == 1:
                         raise
-                    ctx.record_failure(media_url, str(exc), platform)
+                    ctx.record_failure(media_url, logger.failure_message(str(exc)), platform)
                 except (OSError, ValueError) as exc:
-                    ctx.record_failure(media_url, str(exc), platform)
+                    ctx.record_failure(media_url, logger.failure_message(str(exc)), platform)
             # Extraction can omit failed playlist entries entirely; preserve those errors too.
             for message in initial_errors:
-                ctx.record_failure(url, message, platform)
+                ctx.record_failure(url, logger.failure_message(message), platform)
             return results
     except yt_dlp.utils.DownloadError as exc:
-        raise _error(str(exc)) from exc
+        raise _error(logger.failure_message(str(exc))) from exc
+    except DownloadError as exc:
+        message = logger.failure_message(str(exc))
+        if message != str(exc):
+            raise type(exc)(message) from exc
+        raise
     except (OSError, ValueError) as exc:
-        raise DownloadError(str(exc)) from exc
+        raise DownloadError(logger.failure_message(str(exc))) from exc

@@ -51,6 +51,7 @@ class MediaResult:
     files: list[Path] = field(default_factory=list)
     date: str = ""
     license_notes: str = ""
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass

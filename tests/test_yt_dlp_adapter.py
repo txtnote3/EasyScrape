@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import functools
 import http.server
+import json
+import re
+import shutil
+import subprocess
 import threading
 import wave
 from collections.abc import Iterator
@@ -10,10 +14,14 @@ from typing import Any
 
 import pytest
 import yt_dlp
+from yt_dlp.extractor.common import InfoExtractor
 
 from easyscrape.extractors import generic
 from easyscrape.extractors import yt_dlp_adapter as adapter
 from easyscrape.models import DownloadContext, DownloadError, RetryableError
+
+REAL_PROBE_STREAM_TYPES = adapter._probe_stream_types
+REAL_WHICH = shutil.which
 
 
 def media(identifier: str = "one", **overrides: Any) -> dict[str, Any]:
@@ -22,6 +30,8 @@ def media(identifier: str = "one", **overrides: Any) -> dict[str, Any]:
         "title": "Test clip",
         "uploader": "Test author",
         "ext": "mp4",
+        "vcodec": "h264",
+        "acodec": "aac",
         "webpage_url": f"https://example.test/{identifier}",
         "upload_date": "20260102",
         "license": "CC BY",
@@ -38,6 +48,9 @@ def fake_ydl(monkeypatch: pytest.MonkeyPatch) -> type[Any]:
         create_files = True
         merge = False
         outside: Path | None = None
+        stream_types = {"video", "audio"}
+        warnings: list[str] = []
+        source: Path | None = None
         instances: list[Any] = []
         calls: list[str] = []
 
@@ -56,6 +69,8 @@ def fake_ydl(monkeypatch: pytest.MonkeyPatch) -> type[Any]:
 
         def extract_info(self, url: str, download: bool) -> Any:
             assert download is False
+            for warning in self.warnings:
+                self.options["logger"].warning(warning)
             if self.extraction_error:
                 raise self.extraction_error
             return self.extracted
@@ -82,7 +97,9 @@ def fake_ydl(monkeypatch: pytest.MonkeyPatch) -> type[Any]:
                 filename = self.outside
             if self.create_files:
                 filename.parent.mkdir(parents=True, exist_ok=True)
-                filename.write_bytes(b"fixture media stream")
+                filename.write_bytes(
+                    self.source.read_bytes() if self.source else b"fixture media stream"
+                )
             for hook in self.progress_hooks:
                 hook({"status": "downloading", "downloaded_bytes": 5, "total_bytes": 10})
                 hook({"status": "finished", "filename": str(original), "info_dict": info})
@@ -92,7 +109,13 @@ def fake_ydl(monkeypatch: pytest.MonkeyPatch) -> type[Any]:
             return downloaded
 
     monkeypatch.setattr(adapter.yt_dlp, "YoutubeDL", FakeYDL)
-    monkeypatch.setattr(adapter.shutil, "which", lambda executable: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        adapter.shutil,
+        "which",
+        lambda executable: "/usr/bin/ffmpeg" if executable == "ffmpeg" else None,
+    )
+    # Unit downloads have explicitly mocked streams; real-file tests restore the actual probe.
+    monkeypatch.setattr(adapter, "_probe_stream_types", lambda path: set(FakeYDL.stream_types))
     monkeypatch.setattr(adapter.time, "sleep", lambda seconds: None)
     return FakeYDL
 
@@ -157,7 +180,7 @@ def test_merged_file_comes_from_final_hook(tmp_path: Path, fake_ydl: Any) -> Non
 def test_audio_does_not_reencode(
     tmp_path: Path, fake_ydl: Any, monkeypatch: pytest.MonkeyPatch, ext: str
 ) -> None:
-    fake_ydl.extracted = media(ext=ext)
+    fake_ydl.extracted = media(ext=ext, vcodec="none", acodec="opus" if ext == "opus" else "aac")
     monkeypatch.setattr(adapter.shutil, "which", lambda executable: None)
     result = adapter.handle("https://youtu.be/one", context(tmp_path, audio_only=True))[0]
     assert result.files[0].suffix == f".{ext}"
@@ -270,7 +293,7 @@ def test_real_download_never_opens_existing_sidecar_symlink(
     tmp_path: Path, local_audio: tuple[str, Path], force: bool, suffix: str
 ) -> None:
     url, source = local_audio
-    ctx = DownloadContext(tmp_path / "output", platform="generic", force=force)
+    ctx = DownloadContext(tmp_path / "output", platform="generic", force=force, audio_only=True)
     directory = ctx.target_dir() / "unknown" / "fixture"
     directory.mkdir(parents=True)
     external = tmp_path / "external.txt"
@@ -293,7 +316,7 @@ def test_real_download_rejects_existing_final_file_symlink(
     tmp_path: Path, local_audio: tuple[str, Path], force: bool
 ) -> None:
     url, _ = local_audio
-    ctx = DownloadContext(tmp_path / "output", platform="generic", force=force)
+    ctx = DownloadContext(tmp_path / "output", platform="generic", force=force, audio_only=True)
     directory = ctx.target_dir() / "unknown" / "fixture"
     directory.mkdir(parents=True)
     external = tmp_path / "external.txt"
@@ -409,3 +432,394 @@ def test_progress_and_generic_fallback(tmp_path: Path, fake_ydl: Any) -> None:
     assert progress[0] == (0.5, "Test clip")
     assert generic.FALLBACK is True
     assert generic.MATCHERS[0]("https://example.test/one")
+
+
+@pytest.fixture
+def real_stream_files(tmp_path: Path) -> dict[str, Path]:
+    """Generate the ambiguous WebM container with genuinely different streams."""
+    executable = REAL_WHICH("ffmpeg")
+    assert executable, "Real stream validation tests require ffmpeg"
+    files = {
+        "audio": tmp_path / "audio.f251.webm",
+        "video": tmp_path / "video.webm",
+        "merged": tmp_path / "merged.mkv",
+    }
+    commands = [
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.1",
+            "-c:a",
+            "libopus",
+            str(files["audio"]),
+        ],
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=16x16:d=0.1",
+            "-c:v",
+            "libvpx-vp9",
+            str(files["video"]),
+        ],
+        [
+            "-i",
+            str(files["video"]),
+            "-i",
+            str(files["audio"]),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c",
+            "copy",
+            str(files["merged"]),
+        ],
+    ]
+    for arguments in commands:
+        subprocess.run(
+            [executable, "-hide_banner", "-loglevel", "error", "-y", *arguments],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    return files
+
+
+@pytest.fixture
+def local_stream_files(real_stream_files: dict[str, Path]) -> Iterator[tuple[str, dict[str, Path]]]:
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return None
+
+    web_root = real_stream_files["audio"].parent
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(Handler, directory=str(web_root))
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", real_stream_files
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    "kind, audio_only, succeeds",
+    [
+        ("audio", False, False),
+        ("video", False, True),
+        ("merged", False, True),
+    ],
+)
+def test_real_http_download_validates_finished_streams(
+    tmp_path: Path,
+    local_stream_files: tuple[str, dict[str, Path]],
+    kind: str,
+    audio_only: bool,
+    succeeds: bool,
+) -> None:
+    base_url, sources = local_stream_files
+    source = sources[kind]
+    ctx = DownloadContext(
+        tmp_path / "output", platform="generic", audio_only=audio_only, quiet=True
+    )
+
+    results = adapter.handle(f"{base_url}/{source.name}", ctx)
+
+    if succeeds:
+        assert len(results) == 1 and not ctx.failures
+        assert results[0].files[0].read_bytes() == source.read_bytes()
+        actual = adapter._probe_stream_types(results[0].files[0])
+        assert actual == (
+            {"audio"} if kind == "audio" else {"video"} if kind == "video" else {"video", "audio"}
+        )
+    else:
+        assert not results and len(ctx.failures) == 1
+        assert "no video stream" in ctx.failures[0]["message"]
+        assert not [path for path in ctx.out_dir.rglob("*") if path.is_file()]
+
+
+@pytest.mark.parametrize("kind", ["video", "merged"])
+def test_real_video_and_merged_streams_pass_validation(
+    real_stream_files: dict[str, Path], kind: str
+) -> None:
+    path = real_stream_files[kind]
+    adapter._validate_finished_media([path], {"vcodec": "none"}, audio_only=False)
+    assert "video" in (adapter._probe_stream_types(path) or set())
+    if kind == "merged":
+        assert "audio" in (adapter._probe_stream_types(path) or set())
+
+
+def test_real_audio_only_download_stays_audio(
+    tmp_path: Path, local_audio: tuple[str, Path]
+) -> None:
+    url, source = local_audio
+    ctx = DownloadContext(tmp_path / "output", platform="generic", audio_only=True)
+    result = adapter.handle(url, ctx)[0]
+    assert result.files[0].read_bytes() == source.read_bytes()
+    assert adapter._probe_stream_types(result.files[0]) == {"audio"}
+
+
+def test_no_ffprobe_cannot_validate_preserved_file_from_new_metadata(
+    tmp_path: Path, fake_ydl: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = context(tmp_path)
+    directory = ctx.target_dir() / "Test author" / "one"
+    directory.mkdir(parents=True)
+    previous = directory / "Test clip [one].mp4"
+    previous.write_bytes(b"old media not represented by current extraction metadata")
+    monkeypatch.setattr(adapter, "_probe_stream_types", lambda path: None)
+
+    assert adapter.handle("https://youtu.be/one", ctx) == []
+
+    assert len(ctx.failures) == 1 and "Use --force" in ctx.failures[0]["message"]
+    assert previous.read_bytes() == b"old media not represented by current extraction metadata"
+    ctx.force = True
+    results = adapter.handle("https://youtu.be/one", ctx)
+    assert len(results) == 1
+    assert previous.read_bytes() == b"fixture media stream"
+
+
+def test_real_audio_webm_rejected_despite_video_metadata(
+    real_stream_files: dict[str, Path],
+) -> None:
+    path = real_stream_files["audio"]
+    assert adapter._probe_stream_types(path) == {"audio"}
+    with pytest.raises(DownloadError, match="no video stream"):
+        adapter._validate_finished_media([path], {"vcodec": "vp9"}, audio_only=False)
+    adapter._validate_finished_media([path], {"vcodec": "none"}, audio_only=True)
+
+
+def test_adapter_rejects_actual_audio_webm_and_retains_runtime_advice(
+    tmp_path: Path,
+    fake_ydl: Any,
+    real_stream_files: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_ydl.source = real_stream_files["audio"]
+    fake_ydl.extracted = media(ext="webm", vcodec="vp9")
+    fake_ydl.warnings = [
+        "No supported JavaScript runtime could be found. Only deno is enabled by default"
+    ]
+    # fake_ydl deliberately hides executable discovery; restore the actual probe explicitly.
+    ffprobe = REAL_WHICH("ffprobe")
+    assert ffprobe, "Real stream validation tests require ffprobe"
+    monkeypatch.setattr(
+        adapter.shutil, "which", lambda name: ffprobe if name == "ffprobe" else None
+    )
+    monkeypatch.setattr(adapter, "_probe_stream_types", REAL_PROBE_STREAM_TYPES)
+    ctx = context(tmp_path, quiet=True)
+
+    assert adapter.handle("https://youtu.be/one", ctx) == []
+
+    assert len(ctx.failures) == 1
+    assert "no video stream" in ctx.failures[0]["message"]
+    assert "Install Deno" in ctx.failures[0]["message"]
+    assert not list(ctx.out_dir.rglob("*.webm"))
+
+
+@pytest.mark.parametrize(
+    "selected, expected",
+    [
+        ({"vcodec": "h264"}, True),
+        ({"vcodec": "none"}, False),
+        ({"vcodec": "unknown", "height": 720}, True),
+        ({"vcodec": "unknown"}, None),
+        ({"vcodec": "none", "formats": [{"vcodec": "h264"}]}, False),
+        ({"requested_formats": [{"vcodec": "vp9"}, {"vcodec": "none"}]}, True),
+        ({"requested_formats": [{"vcodec": "none"}]}, False),
+    ],
+)
+def test_no_ffprobe_selected_format_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected: dict[str, Any], expected: bool | None
+) -> None:
+    path = tmp_path / "ambiguous.webm"
+    # These are metadata-only unit tests; no file is claimed to have real probed streams.
+    monkeypatch.setattr(adapter, "_probe_stream_types", lambda path: None)
+    if expected:
+        adapter._validate_finished_media([path], selected, audio_only=False)
+    else:
+        with pytest.raises(
+            DownloadError, match="no video stream" if expected is False else "Cannot verify"
+        ):
+            adapter._validate_finished_media([path], selected, audio_only=False)
+
+
+def test_no_ffprobe_audio_download_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(adapter, "_probe_stream_types", lambda path: None)
+    adapter._validate_finished_media([tmp_path / "audio.webm"], {"vcodec": "none"}, audio_only=True)
+
+
+def test_probe_excludes_attached_cover_art(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(adapter.shutil, "which", lambda name: "ffprobe")
+    payload = {
+        "streams": [
+            {"codec_type": "audio"},
+            {"codec_type": "video", "disposition": {"attached_pic": 1}},
+        ]
+    }
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, json.dumps(payload), ""),
+    )
+    with pytest.raises(DownloadError, match="no video stream"):
+        adapter._validate_finished_media([tmp_path / "artwork.m4a"], {"vcodec": "mjpeg"}, False)
+
+
+@pytest.mark.parametrize("stdout, returncode", [("invalid json", 0), ("{}", 0), ("[]", 0), ("", 1)])
+def test_failed_probe_cannot_fall_back_to_claimed_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int
+) -> None:
+    monkeypatch.setattr(adapter.shutil, "which", lambda name: "ffprobe")
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, returncode, stdout, "probe failed"
+        ),
+    )
+    with pytest.raises(DownloadError, match="ffprobe"):
+        adapter._validate_finished_media([tmp_path / "file.mp4"], {"vcodec": "h264"}, False)
+
+
+def test_runtime_warning_does_not_fail_valid_video(tmp_path: Path, fake_ydl: Any) -> None:
+    warning = "No supported JavaScript runtime could be found. Only deno is enabled by default"
+    fake_ydl.warnings = [warning]
+    ctx = context(tmp_path, quiet=True)
+    result = adapter.handle("https://youtu.be/one", ctx)[0]
+    assert not ctx.failures
+    assert result.title == "Test clip"
+    assert len(result.warnings) == 1
+    assert warning in result.warnings[0] and "Install Deno" in result.warnings[0]
+
+
+def test_extraction_failure_keeps_runtime_warning_and_error_type(
+    tmp_path: Path, fake_ydl: Any
+) -> None:
+    fake_ydl.warnings = ["No supported JavaScript runtime could be found"]
+    fake_ydl.extraction_error = yt_dlp.utils.DownloadError("No video formats found")
+    with pytest.raises(adapter.NoMediaError, match="Install Deno"):
+        adapter.handle("https://youtu.be/one", context(tmp_path, quiet=True))
+
+
+def test_js_runtime_discovery_passes_supported_library_parameters(
+    tmp_path: Path, fake_ydl: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = {"deno": "/tools/deno", "node": "/tools/node", "bun": "/tools/bun", "qjs": "/tools/qjs"}
+    monkeypatch.setattr(adapter.shutil, "which", lambda name: paths.get(name))
+    adapter.handle("https://youtu.be/one", context(tmp_path))
+    runtimes = fake_ydl.instances[0].options["js_runtimes"]
+    assert runtimes == {
+        "deno": {"path": "/tools/deno"},
+        "node": {"path": "/tools/node"},
+        "bun": {"path": "/tools/bun"},
+        "quickjs": {"path": "/tools/qjs"},
+    }
+
+
+def test_playlist_continues_after_audio_only_output(
+    tmp_path: Path, fake_ydl: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_ydl.extracted = {"_type": "playlist", "entries": [media("audio"), media("video")]}
+    monkeypatch.setattr(
+        adapter,
+        "_probe_stream_types",
+        lambda path: {"audio"} if "audio" in path.parts else {"video", "audio"},
+    )
+    ctx = context(tmp_path)
+    results = adapter.handle("https://youtube.com/playlist?list=collection", ctx)
+    assert [result.id for result in results] == ["video"]
+    assert len(ctx.failures) == 1 and "no video stream" in ctx.failures[0]["message"]
+
+
+def test_real_yt_dlp_merges_separate_video_and_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = REAL_WHICH("ffmpeg")
+    assert executable, "The native merge integration test requires ffmpeg"
+    video = tmp_path / "video.mp4"
+    audio = tmp_path / "audio.m4a"
+    commands = [
+        ["-f", "lavfi", "-i", "color=c=blue:s=16x16:d=0.1", "-c:v", "libx264", str(video)],
+        ["-f", "lavfi", "-i", "sine=frequency=440:duration=0.1", "-c:a", "aac", str(audio)],
+    ]
+    for arguments in commands:
+        subprocess.run(
+            [executable, "-hide_banner", "-loglevel", "error", "-y", *arguments],
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+    assert adapter._probe_stream_types(video) == {"video"}
+    assert adapter._probe_stream_types(audio) == {"audio"}
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return None
+
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(Handler, directory=str(tmp_path))
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    class LocalFormatsIE(InfoExtractor):
+        _VALID_URL = re.escape(base) + r"/merge$"
+
+        def _real_extract(self, url: str) -> dict[str, Any]:
+            return {
+                "id": "merged",
+                "title": "Native merge",
+                "uploader": "Local fixture",
+                "formats": [
+                    {
+                        "format_id": "video",
+                        "url": f"{base}/video.mp4",
+                        "ext": "mp4",
+                        "vcodec": "h264",
+                        "acodec": "none",
+                        "width": 16,
+                        "height": 16,
+                    },
+                    {
+                        "format_id": "audio",
+                        "url": f"{base}/audio.m4a",
+                        "ext": "m4a",
+                        "vcodec": "none",
+                        "acodec": "aac",
+                    },
+                ],
+            }
+
+    real_downloader = yt_dlp.YoutubeDL
+
+    class LocalDownloader(real_downloader):
+        def __init__(self, options: dict[str, Any]) -> None:
+            # Only extraction metadata is controlled. Downloads and FFmpegMergerPP remain real.
+            super().__init__(options, auto_init=False)
+            self.add_info_extractor(LocalFormatsIE())
+
+    monkeypatch.setattr(adapter.yt_dlp, "YoutubeDL", LocalDownloader)
+    ctx = DownloadContext(tmp_path / "output", platform="youtube", quiet=True)
+    try:
+        results = adapter.handle(f"{base}/merge", ctx)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert len(results) == 1 and not ctx.failures
+    assert len(results[0].files) == 1
+    merged = results[0].files[0]
+    assert merged.parent == ctx.out_dir / "youtube" / "Local fixture" / "merged"
+    assert adapter._probe_stream_types(merged) == {"video", "audio"}
+    assert not list(ctx.out_dir.rglob("*.part"))
+    assert not [path for path in ctx.out_dir.rglob(".easyscrape-*") if path.is_dir()]

@@ -8,7 +8,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.cookiejar import MozillaCookieJar
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from tempfile import TemporaryDirectory
 from typing import Any
 
@@ -21,6 +21,25 @@ from easyscrape.models import DownloadContext, DownloadError, MediaResult, Retry
 _LOCK = threading.RLock()
 _AUTH_PLATFORMS = {"instagram", "facebook", "threads"}
 _LICENSE = "Source metadata does not grant reuse rights; respect the creator's license."
+
+
+def _comparison_path(path: PurePath) -> PurePath:
+    """Compare Windows extended drive/UNC paths using their ordinary anchors.
+
+    gallery-dl enables extended paths by default on Windows. Keep those paths
+    for file operations; normalize only comparisons against our staging/root.
+    """
+    if isinstance(path, PureWindowsPath):
+        drive = path.drive
+        if drive.upper().startswith("\\\\?\\UNC\\"):
+            return PureWindowsPath("\\\\" + str(path)[8:])
+        if len(drive) == 6 and drive.startswith("\\\\?\\") and drive[-1] == ":":
+            return PureWindowsPath(str(path)[4:])
+    return path
+
+
+def _relative_path(path: PurePath, root: PurePath) -> PurePath:
+    return _comparison_path(path).relative_to(_comparison_path(root))
 
 
 def require_cookies(ctx: DownloadContext, platform: str) -> None:
@@ -105,8 +124,12 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
 
     def contained(path: Path) -> Path:
         resolved = path.resolve()
-        if not resolved.is_relative_to(root):
-            raise DownloadError("gallery-dl output path resolves outside the output root")
+        try:
+            _relative_path(resolved, root)
+        except ValueError as exc:
+            raise DownloadError(
+                "gallery-dl output path resolves outside the output root"
+            ) from exc
         return resolved
 
     contained(base)
@@ -179,7 +202,7 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
             # private staging. Existing final files are checked before downloading.
             existing = None
             if self.pathfmt is not None and kwdict.get("extension"):
-                relative_dir = Path(self.pathfmt.realdirectory).relative_to(staging)
+                relative_dir = _relative_path(Path(self.pathfmt.realdirectory), staging)
                 candidate = contained(
                     base / relative_dir / self.pathfmt.build_filename(kwdict)
                 )
@@ -195,7 +218,7 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
             if not filepath.is_file() or filepath.name.endswith(".part"):
                 return
             if existing is None:
-                destination = contained(base / filepath.relative_to(staging))
+                destination = contained(base / _relative_path(filepath, staging))
                 contained(destination.parent)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if destination.is_file() and not ctx.force:
