@@ -164,6 +164,8 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
         },
         "output": {"mode": "null" if ctx.quiet else "terminal"},
     }
+    if ctx.max_items:
+        options["extractor"]["file-range"] = f"1-{ctx.max_items}"
     if ctx.cookies:
         try:
             MozillaCookieJar(str(ctx.cookies)).load(ignore_discard=True, ignore_expires=True)

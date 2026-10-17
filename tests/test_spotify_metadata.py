@@ -54,16 +54,29 @@ def test_complete_collection_preserves_every_item_and_order(kind):
     assert tracks[0].album == ("Album" if kind == "album" else "")
 
 
-@pytest.mark.parametrize("changes, reason", [
-    ({}, "does not advertise"),
-    ({"totalTracks": 3}, "incomplete"),
-    ({"totalTracks": 1, "next": "more"}, "incomplete"),
-    ({"totalTracks": 1, "trackList": [{"title": "Unavailable"}]}, "unavailable"),
-    ({"totalTracks": True}, "does not advertise"),
+@pytest.mark.parametrize("changes, expected, fragment", [
+    ({}, None, "did not report"),
+    ({"totalTracks": 3}, None, "only 1 of 3"),
+    ({"totalTracks": 1, "next": "more"}, None, "only 1 of 1"),
+    ({}, 5, "only 1 of 5"),
 ])
-def test_collection_never_silently_truncates(changes, reason):
-    with pytest.raises(DownloadError, match=reason):
-        parse_embed(embed({"trackList": [entry()], **changes}), "playlist", TRACK_ID)
+def test_partial_collections_are_reported_not_hidden(changes, expected, fragment):
+    notes = []
+    tracks = parse_embed(embed({"trackList": [entry()], **changes}), "playlist", TRACK_ID,
+                         expected, notes)
+    assert len(tracks) == 1 and any(fragment in note for note in notes)
+
+
+def test_unavailable_entries_are_skipped_with_a_note():
+    notes = []
+    tracks = parse_embed(embed({"totalTracks": 2, "trackList": [entry(), {"title": "Gone"}]}),
+                         "playlist", TRACK_ID, None, notes)
+    assert len(tracks) == 1 and any("unavailable" in note for note in notes)
+
+
+def test_collection_with_no_tracks_fails():
+    with pytest.raises(DownloadError, match="no downloadable"):
+        parse_embed(embed({"trackList": [{"title": "Gone"}]}), "album", TRACK_ID)
 
 
 def test_oembed_title_thumbnail_alone_is_not_track_metadata():
@@ -118,3 +131,10 @@ def test_metadata_timeouts_are_retryable_and_paced():
         assert waits == [True]
     finally:
         resolver.close()
+
+
+def test_album_falls_back_to_page_description():
+    page = ('<meta property="og:description" '
+            'content="Billie Eilish · HIT ME HARD AND SOFT · Song · 2024"/>')
+    track = supplement_page(SpotifyTrack(TRACK_ID, "Song", "Billie Eilish"), page)
+    assert track.album == "HIT ME HARD AND SOFT"

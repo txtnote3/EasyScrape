@@ -16,7 +16,7 @@ from ytmusicapi import YTMusic
 
 from easyscrape.models import DownloadContext, DownloadError, MediaResult, RetryableError
 
-from .spotify_matching import choose_match
+from .spotify_matching import choose_match_detailed
 from .spotify_metadata import URL_PATTERN, SpotifyResolver, SpotifyTrack
 from .spotify_tags import download_cover, write_tags
 
@@ -39,13 +39,13 @@ def _retry(action: Callable[[], _T]) -> _T:
 def _external_error(operation: str, exc: Exception) -> DownloadError:
     text = str(exc)
     transient = any(word in text.casefold() for word in
-                    ("429", "timed out", "timeout", "temporar", "connection", "502", "503"))
+                    ("429", "403", "timed out", "timeout", "temporar", "connection", "502", "503"))
     transient = transient or bool(re.search(r"\b5\d{2}\b", text))
     message = f"{operation} failed: {text}"
     return RetryableError(message) if transient else DownloadError(message)
 
 
-def _find(track: SpotifyTrack, ctx: DownloadContext) -> str:
+def _find(track: SpotifyTrack, ctx: DownloadContext) -> tuple[str, float]:
     ctx.wait_for_slot("youtube")
     try:
         candidates = YTMusic().search(f"{track.artist} - {track.title}", filter="songs", limit=20)
@@ -53,7 +53,7 @@ def _find(track: SpotifyTrack, ctx: DownloadContext) -> str:
         raise _external_error("YouTube Music search", exc) from exc
     if not isinstance(candidates, list):
         raise DownloadError("YouTube Music search returned unsupported metadata")
-    return choose_match(track, [item for item in candidates if isinstance(item, dict)])
+    return choose_match_detailed(track, [item for item in candidates if isinstance(item, dict)])
 
 
 def _download(video_id: str, staging: Path, ctx: DownloadContext) -> Path:
@@ -121,7 +121,9 @@ def _download(video_id: str, staging: Path, ctx: DownloadContext) -> Path:
     return path
 
 
-def _save(track: SpotifyTrack, video_id: str, ctx: DownloadContext) -> MediaResult:
+def _save(
+    track: SpotifyTrack, video_id: str, ctx: DownloadContext, delta: float = 0.0
+) -> MediaResult:
     directory = (ctx.target_dir(PLATFORM) / ctx.safe_filename(track.artist)
                  / ctx.safe_filename(track.album or "Unknown album"))
     root = ctx.out_dir.resolve()
@@ -148,6 +150,8 @@ def _save(track: SpotifyTrack, video_id: str, ctx: DownloadContext) -> MediaResu
     return MediaResult(
         url=track.url, platform=PLATFORM, title=track.title, author=track.artist,
         id=track.id, files=[target.resolve()],
+        warnings=([f"Approximate match: duration differs from Spotify by {delta:.0f} s "
+                   "(likely a remaster or reissue)"] if delta > 2 else []),
         license_notes=("Audio sourced from a matched public YouTube Music recording, "
                        "not Spotify's stream; original lossy M4A/Opus, no transcoding. "
                        "Download only content you have permission to use."),
@@ -159,6 +163,11 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
     try:
         # The dispatcher owns source-level retries; child operations retry here.
         tracks = resolver.resolve(url)
+        if ctx.max_items:
+            tracks = tracks[: ctx.max_items]
+        notes = list(getattr(resolver, "warnings", []))
+        for note in notes:
+            ctx.log(f"Spotify: {note}")
         results: list[MediaResult] = []
         for track in tracks:
             if ctx.is_downloaded(track.url):
@@ -166,12 +175,14 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
                 continue
             try:
                 complete = _retry(partial(resolver.complete, track))
-                video_id = _retry(partial(_find, complete, ctx))
-                results.append(_save(complete, video_id, ctx))
+                video_id, delta = _retry(partial(_find, complete, ctx))
+                results.append(_save(complete, video_id, ctx, delta))
             except DownloadError as exc:
                 ctx.record_failure(track.url, str(exc), PLATFORM)
             except Exception as exc:
                 ctx.record_failure(track.url, f"Spotify track processing failed: {exc}", PLATFORM)
+        if results:
+            results[0].warnings.extend(notes)
         return results
     finally:
         resolver.close()

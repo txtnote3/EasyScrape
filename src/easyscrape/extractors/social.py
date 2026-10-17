@@ -1,6 +1,7 @@
 """Social media routing; extraction remains with upstream downloader libraries."""
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 from easyscrape.models import DownloadContext, DownloadError, MediaResult
@@ -30,7 +31,6 @@ def platform_for(url: str) -> str:
 def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
     platform = platform_for(url)
     ctx.platform = platform
-    gallery_dl_adapter.require_cookies(ctx, platform)
     path = urlsplit(url).path.lower()
     hostname = (urlsplit(url).hostname or "").lower()
     explicit_video = (
@@ -49,6 +49,22 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
         except yt_dlp_adapter.NoMediaError:
             if ctx.audio_only:
                 raise
+            gallery_dl_adapter.require_cookies(ctx, platform)
             return gallery_dl_adapter.handle(url, ctx)
+        except DownloadError:
+            # Public reels/videos often work anonymously; only blame missing cookies on failure.
+            gallery_dl_adapter.require_cookies(ctx, platform)
+            raise
+    gallery_dl_adapter.require_cookies(ctx, platform)
     # Gallery-first handles mixed image/video posts without losing carousel images.
-    return gallery_dl_adapter.handle(url, ctx)
+    try:
+        return gallery_dl_adapter.handle(url, ctx)
+    except DownloadError as exc:
+        if platform == "reddit" and not (ctx.cookies or ctx.cookies_from_browser) and re.search(
+            r"blocked|forbidden|403|authenticat|log.?in", str(exc), re.I
+        ):
+            raise DownloadError(
+                f"{exc} Reddit blocks anonymous access from many networks; retry with "
+                "--cookies or --cookies-from-browser from a logged-in browser."
+            ) from exc
+        raise

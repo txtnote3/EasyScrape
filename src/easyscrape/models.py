@@ -60,6 +60,9 @@ class DownloadContext:
     cookies: Path | None = None
     cookies_from_browser: str | None = None
     audio_only: bool = False
+    audio_format: str = "best"
+    max_height: int | None = None
+    max_items: int | None = None
     force: bool = False
     quiet: bool = False
     metadata: bool = True

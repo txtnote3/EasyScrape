@@ -68,3 +68,29 @@ def test_unknown_candidate_duration_no_match_is_actionable():
                                             ("3:99", None), ("live", None), (None, None)])
 def test_youtube_music_duration_parser(value, expected):
     assert candidate_duration({"duration": value}) == expected
+
+
+def test_remaster_with_slightly_different_duration_matches_with_delta():
+    from easyscrape.extractors.spotify_matching import choose_match_detailed
+    from easyscrape.extractors.spotify_metadata import SpotifyTrack
+
+    source = SpotifyTrack("4uLU6hMCjMI75M1A2tKUQC", "Time", "Pink Floyd", "Album", 422.8)
+    candidates = [
+        {"title": "Time (2023 Remaster)", "videoId": "abcdefghijk", "duration_seconds": 426,
+         "artists": [{"name": "Pink Floyd"}]},
+        {"title": "Time", "videoId": "bbbbbbbbbbb", "duration_seconds": 407,
+         "artists": [{"name": "Think Floyd"}]},
+    ]
+    ident, delta = choose_match_detailed(source, candidates)
+    assert ident == "abcdefghijk" and 2 < delta < 5
+
+
+def test_relaxed_tier_never_accepts_different_title():
+    from easyscrape.extractors.spotify_matching import choose_match_detailed
+    from easyscrape.extractors.spotify_metadata import SpotifyTrack
+
+    source = SpotifyTrack("4uLU6hMCjMI75M1A2tKUQC", "Time", "Pink Floyd", "Album", 400.0)
+    other = {"title": "Timeless Moments", "videoId": "abcdefghijk", "duration_seconds": 405,
+             "artists": [{"name": "Pink Floyd"}]}
+    with pytest.raises(DownloadError):
+        choose_match_detailed(source, [other])

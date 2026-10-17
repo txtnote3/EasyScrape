@@ -74,3 +74,15 @@ def test_single_url_input_is_deduplicated_and_has_local_default_output(
     assert batch.duplicates == []
     assert batch.source_path is None
     assert batch.default_out == tmp_path / "EasyScrape_Downloads"
+
+
+def test_input_accepts_multiple_sources_prose_and_failed_json(tmp_path):
+    from easyscrape.input import load_input
+
+    notes = tmp_path / "notes.txt"
+    notes.write_text("watch this https://a.example/x, and https://b.example/y\n", encoding="utf-8")
+    report = tmp_path / "failed.json"
+    report.write_text('[{"url": "https://c.example/z", "message": "boom"}]', encoding="utf-8")
+    batch = load_input([str(notes), str(report), "https://a.example/x"])
+    assert batch.urls == ["https://a.example/x", "https://b.example/y", "https://c.example/z"]
+    assert batch.duplicates == ["https://a.example/x"]

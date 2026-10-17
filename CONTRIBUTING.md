@@ -1,17 +1,17 @@
-# Contributing
+# Katkı rehberi
 
-## Development setup
+## Geliştirme ortamı
 
-Use Python 3.10 or newer. Create a virtual environment and install the editable package with development tools:
+Python 3.10 veya üstünü kullanın. Sanal ortam oluşturup geliştirme araçlarıyla birlikte düzenlenebilir kurulum yapın:
 
 ```sh
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows'ta: .venv\Scripts\activate
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-Run the same checks used by continuous integration before opening a change:
+Değişiklik açmadan önce sürekli entegrasyonda kullanılan kontrolleri çalıştırın:
 
 ```sh
 python -m pytest
@@ -20,13 +20,13 @@ mypy src/easyscrape
 python -m build
 ```
 
-Tests should be deterministic and must not fetch live media or require account credentials. Mock network-facing extractors or use local fixtures. Keep cookie files, browser data, downloaded media, and credentials out of commits.
+Testler belirleyici olmalı; canlı medya indirmemeli ve hesap bilgisi gerektirmemelidir. Ağa bağlanan çıkarıcıları sahte (mock) veya yerel örnek verilerle test edin. Çerez dosyalarını, tarayıcı verilerini, indirilen medyayı ve kimlik bilgilerini commit'lere koymayın.
 
-## Adding an extractor
+## Çıkarıcı ekleme
 
-Add a module below `src/easyscrape/extractors/` with `PLATFORM`, `MATCHERS`, and a `handle(url, context)` function. Use the shared `DownloadContext` for output paths and options, and return `MediaResult` instances for completed files. Raise `DownloadError` for a URL that cannot be handled and `RetryableError` only when retrying a transient failure is useful. Keep matchers specific so they run before the generic yt-dlp fallback.
+`src/easyscrape/extractors/` altına `PLATFORM`, `MATCHERS` ve bir `handle(url, context)` işlevi olan bir modül ekleyin. Çıktı yolları ve seçenekler için ortak `DownloadContext` nesnesini kullanın, tamamlanan dosyalar için `MediaResult` örnekleri döndürün. İşlenemeyen URL için `DownloadError`, yalnızca geçici bir hatada yeniden denemek işe yarıyorsa `RetryableError` fırlatın. Eşleştiricileri dar tutun ki genel yt-dlp yedeğinden önce çalışsınlar.
 
-When yt-dlp can handle a source, a plugin can register a specific route by delegating to its existing adapter:
+yt-dlp bir kaynağı işleyebiliyorsa, eklenti mevcut adaptöre devrederek özel bir yol kaydedebilir:
 
 ```python
 from easyscrape.extractors.yt_dlp_adapter import handle as download_with_ytdlp
@@ -40,10 +40,10 @@ def handle(url: str, context: DownloadContext) -> list[MediaResult]:
     return download_with_ytdlp(url, context)
 ```
 
-Use a source-specific upstream adapter when yt-dlp does not support the site. The plugin should route URLs and pass the shared context through; keep media extraction in an existing or dedicated upstream adapter.
+yt-dlp siteyi desteklemiyorsa siteye özel bir yukarı akış adaptörü kullanın. Eklenti URL'leri yönlendirmeli ve ortak bağlamı iletmelidir; medya çıkarma işi mevcut ya da ayrı bir adaptörde kalmalıdır.
 
-Add offline tests for URL matching, output naming, failure handling, and metadata behavior. Do not make routine tests depend on credentials, browser profiles, or live service availability.
+URL eşleştirme, çıktı adlandırma, hata yönetimi ve metadata davranışı için çevrimdışı testler ekleyin. Rutin testleri kimlik bilgilerine, tarayıcı profillerine veya canlı servis erişimine bağımlı yapmayın.
 
-## Scope and safety
+## Kapsam ve güvenlik
 
-EasyScrape uses upstream extractor capabilities and does not bypass DRM, paywalls, or access controls. Do not add code that circumvents a service's access protections. Treat cookie material as a secret: consume it locally, never log it, and never include it in fixtures or reports. Preserve the no-telemetry behavior.
+EasyScrape yukarı akış çıkarıcıların yeteneklerini kullanır; DRM'yi, ücretli duvarları veya erişim kısıtlarını aşmaz. Bir servisin erişim korumalarını dolanan kod eklemeyin. Çerez verisini gizli tutun: yalnızca yerelde kullanın, asla günlüğe yazmayın, örnek verilere veya raporlara koymayın. Telemetri göndermeme davranışını koruyun.

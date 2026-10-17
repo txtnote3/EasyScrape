@@ -105,8 +105,12 @@ def _track_id(data: dict[str, Any]) -> str:
     raise DownloadError("Spotify collection contains an unavailable or unidentified track")
 
 
-def parse_embed(page: str, kind: str, ident: str) -> list[SpotifyTrack]:
-    """Parse supported public embed JSON; refuse unproven collection completeness."""
+def parse_embed(
+    page: str, kind: str, ident: str, expected: int | None = None,
+    warnings: list[str] | None = None,
+) -> list[SpotifyTrack]:
+    """Parse public embed JSON; report (not hide) collections that may be incomplete."""
+    notes = warnings if warnings is not None else []
     match = _NEXT_DATA.search(page)
     if not match:
         raise DownloadError("Spotify public embed metadata is unavailable")
@@ -132,25 +136,33 @@ def parse_embed(page: str, kind: str, ident: str) -> list[SpotifyTrack]:
         raise DownloadError("Spotify collection track metadata is unavailable")
     advertised = next((entity[key] for key in ("totalTracks", "trackCount", "total")
                        if key in entity), None)
-    if not isinstance(advertised, int) or isinstance(advertised, bool) or advertised < 1:
-        raise DownloadError(
-            "Spotify public collection does not advertise a complete track count; "
-            "authless album/playlist expansion is unsupported for this page"
-        )
-    if advertised != len(entries) or entity.get("next"):
-        raise DownloadError(
-            f"Spotify public collection is incomplete: {len(entries)} of {advertised} tracks"
-        )
+    total = (advertised if isinstance(advertised, int) and not isinstance(advertised, bool)
+             and advertised >= 1 else expected)
     tracks: list[SpotifyTrack] = []
     album = (_text(entity.get("title")) or _text(entity.get("name"))) if kind == "album" else ""
     for number, entry in enumerate(entries, 1):
-        if not isinstance(entry, dict):
-            raise DownloadError("Spotify collection contains an unavailable track")
-        tracks.append(SpotifyTrack(
-            _track_id(entry), _text(entry.get("title")) or _text(entry.get("name")),
-            _artist(entry), _album(entry) or album, _duration(entry),
-            _cover(entry) or (_cover(entity) if kind == "album" else ""), number,
-        ))
+        try:
+            if not isinstance(entry, dict):
+                raise DownloadError("unavailable track")
+            tracks.append(SpotifyTrack(
+                _track_id(entry), _text(entry.get("title")) or _text(entry.get("name")),
+                _artist(entry), _album(entry) or album, _duration(entry),
+                _cover(entry) or (_cover(entity) if kind == "album" else ""), number,
+            ))
+        except DownloadError:
+            notes.append(f"Skipped unavailable Spotify entry #{number}")
+    if not tracks:
+        raise DownloadError("Spotify collection contains no downloadable tracks")
+    if total is None:
+        notes.append(
+            f"Spotify did not report a track count; downloaded the {len(tracks)} tracks "
+            "its public embed lists"
+        )
+    elif len(entries) < total or entity.get("next"):
+        notes.append(
+            f"Spotify's public embed lists only {len(entries)} of {total} tracks; "
+            "the rest cannot be read without a Spotify login"
+        )
     return tracks
 
 
@@ -196,12 +208,29 @@ def supplement_page(track: SpotifyTrack, page: str) -> SpotifyTrack:
                 duration_s=track.duration_s or seconds,
                 cover_url=track.cover_url or _text(node.get("image")),
             )
+    if not track.album:
+        track = replace(track, album=_album_from_description(page))
     return track
+
+
+def _album_from_description(page: str) -> str:
+    """Spotify prints 'Artist · Album · Song · Year' as the track page description."""
+    match = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"', page)
+    parts = [part.strip() for part in unescape(match[1]).split("·")] if match else []
+    return parts[1] if len(parts) >= 4 and parts[1] else ""
+
+
+def _page_track_count(page: str) -> int | None:
+    """Read the track total Spotify prints on the public collection page."""
+    match = re.search(r'music:song_count"\s+content="(\d+)"', page) or re.search(
+        r'og:description"\s+content="[^"]*?(\d+)\s+songs?"', page)
+    return int(match[1]) if match and int(match[1]) > 0 else None
 
 
 class SpotifyResolver:
     def __init__(self, pace: Callable[[], None] | None = None) -> None:
         self.pace = pace
+        self.warnings: list[str] = []
         self.client = httpx.Client(
             timeout=15, follow_redirects=True,
             headers={"User-Agent": "EasyScrape/0.1 (public metadata resolver)"},
@@ -233,9 +262,15 @@ class SpotifyResolver:
         if not match:
             raise DownloadError("Unsupported Spotify URL; expected a track, album, or playlist")
         kind, ident = match.groups()
-        tracks = parse_embed(self._page(f"https://open.spotify.com/embed/{kind}/{ident}"),
-                             kind, ident)
-        return tracks
+        embed_page = self._page(f"https://open.spotify.com/embed/{kind}/{ident}")
+        expected = None
+        if kind != "track":
+            try:
+                expected = _page_track_count(self._page(f"https://open.spotify.com/{kind}/{ident}"))
+            except DownloadError:
+                expected = None
+        self.warnings = []
+        return parse_embed(embed_page, kind, ident, expected, self.warnings)
 
     def complete(self, track: SpotifyTrack) -> SpotifyTrack:
         if not track.title or not track.artist or track.duration_s is None or not track.album:

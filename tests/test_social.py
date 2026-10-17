@@ -104,3 +104,28 @@ def test_auth_failure_does_not_fall_back(tmp_path, monkeypatch):
 def test_instagram_requires_cookies(tmp_path):
     with pytest.raises(DownloadError, match="requires login cookies"):
         social.handle("https://www.instagram.com/p/ABC/", DownloadContext(tmp_path))
+
+
+def test_instagram_reel_tries_anonymous_video_first(tmp_path, monkeypatch):
+    expected = [MediaResult("https://www.instagram.com/reel/ABC/", "instagram")]
+    monkeypatch.setattr(social.yt_dlp_adapter, "handle", lambda u, c: expected)
+    result = social.handle("https://www.instagram.com/reel/ABC/", DownloadContext(tmp_path))
+    assert result == expected
+
+
+def test_instagram_reel_failure_without_cookies_reports_login(tmp_path, monkeypatch):
+    def fail(url, ctx):
+        raise DownloadError("empty media response")
+
+    monkeypatch.setattr(social.yt_dlp_adapter, "handle", fail)
+    with pytest.raises(DownloadError, match="requires login cookies"):
+        social.handle("https://www.instagram.com/reel/ABC/", DownloadContext(tmp_path))
+
+
+def test_reddit_block_error_suggests_cookies(tmp_path, monkeypatch):
+    def blocked(url, ctx):
+        raise DownloadError('gallery-dl failed for reddit (status 4). "You\'ve been blocked"')
+
+    monkeypatch.setattr(social.gallery_dl_adapter, "handle", blocked)
+    with pytest.raises(DownloadError, match="--cookies-from-browser"):
+        social.handle("https://www.reddit.com/r/x/comments/abc/t/", DownloadContext(tmp_path))

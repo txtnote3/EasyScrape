@@ -510,7 +510,7 @@ def local_stream_files(real_stream_files: dict[str, Path]) -> Iterator[tuple[str
 @pytest.mark.parametrize(
     "kind, audio_only, succeeds",
     [
-        ("audio", False, False),
+        ("audio", False, True),
         ("video", False, True),
         ("merged", False, True),
     ],
@@ -537,6 +537,8 @@ def test_real_http_download_validates_finished_streams(
         assert actual == (
             {"audio"} if kind == "audio" else {"video"} if kind == "video" else {"video", "audio"}
         )
+        if kind == "audio":
+            assert any("only provides audio" in note for note in results[0].warnings)
     else:
         assert not results and len(ctx.failures) == 1
         assert "no video stream" in ctx.failures[0]["message"]

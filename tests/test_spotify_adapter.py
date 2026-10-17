@@ -36,9 +36,9 @@ def test_unmatched_track_failure_does_not_lose_later_collection_tracks(tmp_path,
     def find(item, ctx):
         if item.id == TRACK_ID:
             raise DownloadError("No YouTube Music match")
-        return "abcdefghijk"
+        return "abcdefghijk", 0.0
     monkeypatch.setattr(adapter, "_find", find)
-    monkeypatch.setattr(adapter, "_save", lambda item, ident, ctx:
+    monkeypatch.setattr(adapter, "_save", lambda item, ident, ctx, delta=0.0:
                         MediaResult(item.url, "spotify", id=item.id))
     ctx = DownloadContext(tmp_path, platform="spotify")
     results = adapter.handle("https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy", ctx)

@@ -75,7 +75,13 @@ def _browser_cookies(specification: str) -> tuple[str, str | None, str | None, s
 
 
 def _error(message: str) -> DownloadError:
-    if re.search(r"(?:429|5\d\d|timed? out|timeout|temporar|connection reset)", message, re.I):
+    if re.search(
+        r"(?:429|5\d\d|timed? out|timeout|temporar|connection reset"
+        r"|unable to extract yt initial data|incomplete data received"
+        r"|requested format is not available)",
+        message,
+        re.I,
+    ):
         return RetryableError(message)
     if re.search(r"(?:log.?in|cookies|sign.?in|private|permission|403|401)", message, re.I):
         return DownloadError(message)
@@ -152,7 +158,11 @@ def _download_media(
                 )
             files = _actual_files(downloaded, events, directory)
             if not files:
-                raise DownloadError("yt-dlp finished without producing a media file")
+                # A silent empty result (no exception, no file) is yt-dlp's way of
+                # surfacing corrupted upstream responses (e.g. YouTube's flaky
+                # "unable to extract yt initial data"). Treat it as transient and
+                # let the retry loop run instead of failing the item outright.
+                raise RetryableError("yt-dlp finished without producing a media file")
             return downloaded, files
         except yt_dlp.utils.DownloadError as exc:
             error = _error(str(exc))
@@ -233,9 +243,21 @@ def _format_video(info: dict[str, Any]) -> bool | None:
     return None
 
 
-def _validate_finished_media(files: list[Path], info: dict[str, Any], audio_only: bool) -> None:
+def _source_is_audio_only(info: dict[str, Any]) -> bool:
+    """True only when extraction listed formats and none of them carries video."""
+    formats = info.get("formats")
+    if not isinstance(formats, list) or not formats:
+        return False
+    return not any(isinstance(f, dict) and _format_video(f) is True for f in formats)
+
+
+def _validate_finished_media(
+    files: list[Path], info: dict[str, Any], audio_only: bool
+) -> list[str]:
+    """Reject video downloads that lost their video; return notes for audio-only sources."""
+    notes: list[str] = []
     if audio_only:
-        return
+        return notes
     for path in files:
         streams = _probe_stream_types(path)
         has_video = "video" in streams if streams is not None else _selected_video(info, path)
@@ -245,10 +267,14 @@ def _validate_finished_media(files: list[Path], info: dict[str, Any], audio_only
                 "does not identify a video codec. Install ffmpeg (including ffprobe) to verify it."
             )
         if not has_video:
+            if _source_is_audio_only(info):
+                notes.append("The source only provides audio; saved as an audio file.")
+                continue
             raise DownloadError(
                 "The finished media has no video stream (audio-only output). "
                 "Use --audio-only for audio, or check yt-dlp's available video formats and retry."
             )
+    return notes
 
 
 def _js_runtimes() -> dict[str, dict[str, str]]:
@@ -296,13 +322,16 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
         )
     logger = _Logger(ctx)
     ffmpeg_available = shutil.which("ffmpeg") is not None
+    height = f"[height<={ctx.max_height}]" if ctx.max_height else ""
     options: dict[str, Any] = {
         "format": "bestaudio"
         if ctx.audio_only
         else (
-            "bestvideo*+bestaudio/best"
+            (f"bestvideo*{height}+bestaudio/best{height}/" if height else "")
+            + "bestvideo*+bestaudio/best"
             if ffmpeg_available
-            else "best[acodec!=none][vcodec!=none]/best"
+            else (f"best{height}[acodec!=none][vcodec!=none]/" if height else "")
+            + "best[acodec!=none][vcodec!=none]/best"
         ),
         "quiet": True,
         "no_warnings": False,
@@ -318,6 +347,14 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
         "restrictfilenames": True,
         "windowsfilenames": True,
     }
+    if ctx.max_items:
+        options["playlistend"] = ctx.max_items
+    if ctx.audio_only and ctx.audio_format != "best":
+        if not ffmpeg_available:
+            raise DownloadError(f"--audio-format {ctx.audio_format} requires ffmpeg on PATH")
+        options["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": ctx.audio_format}
+        ]
     if ctx.cookies:
         if not Path(ctx.cookies).is_file():
             raise DownloadError("The cookies file does not exist or is not a regular file")
@@ -394,7 +431,12 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
                     raise DownloadError("Media directory escapes the configured output directory")
                 directory.mkdir(parents=True, exist_ok=True)
                 directory = directory.resolve()
-                stem = _component(ctx, f"{title} [{media_id}]", "media")
+                # Windows rejects paths past ~260 characters; leave room for the staging
+                # directory and yt-dlp suffixes such as ".f616.mp4.ytdl".
+                suffix = f" [{media_id}]"
+                budget = 240 - (len(str(directory)) + 1 + len(".easyscrape-xxxxxxxx") + 1) - 24
+                title_part = title[: max(16, budget - len(suffix))] if len(title) > 16 else title
+                stem = _component(ctx, f"{title_part.rstrip()}{suffix}", "media")
                 events.clear()
                 try:
                     # A newly created private directory keeps every yt-dlp intermediate file
@@ -406,7 +448,9 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
                         downloaded, staged_files = _download_media(
                             downloader, entry, events, staging, ctx, logger
                         )
-                        _validate_finished_media(staged_files, downloaded, ctx.audio_only)
+                        notes = _validate_finished_media(
+                            staged_files, downloaded, ctx.audio_only
+                        )
                         for staged_file in staged_files:
                             existing = directory / staged_file.name
                             if not ctx.force and existing.is_file() and not existing.is_symlink():
@@ -435,7 +479,7 @@ def handle(url: str, ctx: DownloadContext) -> list[MediaResult]:
                                 or ""
                             ),
                             license_notes=str(downloaded.get("license") or ""),
-                            warnings=logger.media_warnings(),
+                            warnings=[*logger.media_warnings(), *notes],
                         )
                     )
                 except DownloadError as exc:
